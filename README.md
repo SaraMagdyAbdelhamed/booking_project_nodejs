@@ -71,6 +71,10 @@ SkyBooking Engine is a high-concurrency Online Travel Agency (OTA) and travel se
 
 Approach: separate flight and hotel bookings into independent entity tables, without a common base entity table.
 
+`FLIGHTS` and `HOTELS` are a **provider offer cache**: every search result returned to a client is upserted here first (keyed by `provider` + `provider_offer_id`), so anything a user can book or favorite already has a real internal `id` backing it — bookings/favorites never point at a bare provider ID that isn't persisted. Offers expire (`expires_at`) since provider price/availability is only valid briefly; booking re-validates against the provider before confirming.
+
+`PAYMENT_PROVIDERS` holds per-provider config (Stripe, PayMob, etc) — credentials are stored as vault/secret-manager references inside `config`, never raw keys in the DB. `PAYMENTS` is the one logical payment per booking (aggregate status, which provider). `TRANSACTIONS` is the detail ledger under it — one row per attempt/event (authorize, capture, refund, retry), each carrying the provider's own transaction id and raw response for reconciliation. A payment can have many transactions; a refund is a new transaction row against the existing payment, not a new payment.
+
 ```mermaid
 erDiagram
     USERS ||--o{ FLIGHT_BOOKINGS : places
@@ -78,8 +82,15 @@ erDiagram
     USERS ||--o{ NOTIFICATIONS : receives
     USERS ||--o{ FAVORITES : saves
     USERS ||--o{ AUDIT_LOGS : "acts (actor)"
+    FLIGHTS ||--o{ FLIGHT_BOOKINGS : "booked as"
+    HOTELS ||--o{ HOTEL_BOOKINGS : "booked as"
+    FLIGHTS ||--o{ FAVORITES : "saved (type=flight)"
+    HOTELS ||--o{ FAVORITES : "saved (type=hotel)"
     FLIGHT_BOOKINGS ||--o| PAYMENTS : "paid via"
     HOTEL_BOOKINGS ||--o| PAYMENTS : "paid via"
+    PAYMENT_PROVIDERS ||--o{ PAYMENTS : processes
+    PAYMENTS ||--o{ TRANSACTIONS : has
+    PAYMENT_PROVIDERS ||--o{ TRANSACTIONS : via
 
     USERS {
         int id PK
@@ -88,13 +99,44 @@ erDiagram
         datetime created_at
     }
 
-    FLIGHT_BOOKINGS {
+    FLIGHTS {
         int id PK
-        int user_id FK
+        string provider
+        string provider_offer_id
         string airline_code
         string flight_number
         string departure_airport
         string arrival_airport
+        datetime departure_time
+        datetime arrival_time
+        string cabin_class
+        decimal price
+        string currency
+        json raw_payload
+        datetime expires_at
+        datetime created_at
+    }
+
+    HOTELS {
+        int id PK
+        string provider
+        string provider_offer_id
+        string hotel_name
+        string room_type
+        int stars
+        boolean free_cancellation
+        decimal price_per_night
+        string currency
+        json raw_payload
+        datetime expires_at
+        datetime created_at
+    }
+
+    FLIGHT_BOOKINGS {
+        int id PK
+        int user_id FK
+        int flight_id FK
+        string seat_number
         decimal total_amount
         string status
     }
@@ -102,9 +144,9 @@ erDiagram
     HOTEL_BOOKINGS {
         int id PK
         int user_id FK
-        string hotel_id
-        string hotel_name
+        int hotel_id FK
         date check_in_date
+        date check_out_date
         decimal total_amount
         string status
     }
@@ -113,8 +155,34 @@ erDiagram
         int id PK
         string booking_type FK
         int booking_id
+        int provider_id FK
         decimal amount
+        string currency
         string status
+        datetime created_at
+    }
+
+    PAYMENT_PROVIDERS {
+        int id PK
+        string name
+        string environment
+        boolean is_active
+        json config
+        datetime created_at
+    }
+
+    TRANSACTIONS {
+        int id PK
+        int payment_id FK
+        int provider_id FK
+        string type
+        string method
+        decimal amount
+        string currency
+        string status
+        string provider_transaction_id
+        json raw_response
+        datetime created_at
     }
 
     NOTIFICATIONS {
@@ -129,9 +197,8 @@ erDiagram
         int id PK
         int user_id FK
         string type
-        string ref_id
+        int ref_id FK
         decimal target_price
-        string snapshot
     }
 
     AUDIT_LOGS {
@@ -176,7 +243,8 @@ flowchart TD
     B -->|No| D[Fan-out Parallel Async Requests<br/>Amadeus, Duffel, Tequila]
     D --> E[Wait for Results OR 2.5s Timeout]
     E --> F[Deduplicate & Normalize]
-    F --> G[Save to Redis & Return Response]
+    F --> G[Upsert into FLIGHTS/HOTELS table<br/>by provider + provider_offer_id]
+    G --> H[Save to Redis & Return Response<br/>id = FLIGHTS/HOTELS.id]
 ```
 
 ## 9. Sequence Diagram: Flight Booking Pipeline
@@ -204,6 +272,8 @@ sequenceDiagram
 - Suppliers return standardized ISO currency rates, or require local client-side handling.
 - Payment holds are finalized synchronously before confirming supplier bookings.
 - Redis is deployed with persistence enabled to survive restarts during cached search spikes.
+- Every search result is upserted into `FLIGHTS`/`HOTELS` (provider offer cache) before being returned, so the `id` a client books or favorites always exists in the DB — never a bare provider ID with nothing behind it.
+- Offers expire (`expires_at`); booking re-validates price/availability with the provider if the offer is stale rather than trusting the cached row blindly.
 
 ## 11. Tech Stack
 
@@ -647,8 +717,16 @@ function searchFlights(query):
     deduped = deduplicateByFlightSignature(merged)
     normalized = normalizeToInternalSchema(deduped)
 
-    redis.set(cacheKey, normalized, ttl=5min)
-    return normalized
+    // persist so returned ids are real rows a client can book/favorite
+    saved = normalized.map(offer =>
+        db.flights.upsert(
+            { provider: offer.provider, providerOfferId: offer.externalId },
+            { ...offer, rawPayload: offer.raw, expiresAt: now() + 15min }
+        )
+    )
+
+    redis.set(cacheKey, saved, ttl=5min)
+    return saved
 ```
 
 ### 16.2 AI Natural-Language Search
@@ -708,20 +786,44 @@ function monthPriceView(origin, destination, month, airline):
 See sequence diagram in [§9](#9-sequence-diagram-flight-booking-pipeline).
 
 ```
-function bookFlight(payload):
-    flight = validateFlightStillAvailable(payload)
-    booking = db.flightBookings.create({ ...payload, status: 'pending_payment' })
+function bookFlight(flightId, userId, seatNumber, method, provider):
+    flight = db.flights.find(flightId)  // the persisted offer, not a bare provider id
+    if flight.expiresAt < now():
+        flight = revalidateWithProvider(flight)  // reprice/re-check availability, refresh row
 
-    tx = paymentProvider.initiateTransaction(booking.totalAmount, method, provider)
+    booking = db.flightBookings.create({
+        userId, flightId: flight.id, seatNumber,
+        totalAmount: flight.price, status: 'pending_payment',
+    })
+
+    providerConfig = db.paymentProviders.findByName(provider)  // e.g. Stripe/PayMob, config incl. vault key refs
+    payment = db.payments.create({
+        bookingType: 'flight', bookingId: booking.id, providerId: providerConfig.id,
+        amount: booking.totalAmount, currency: flight.currency, status: 'pending',
+    })
+    txn = db.transactions.create({
+        paymentId: payment.id, providerId: providerConfig.id,
+        type: 'authorize', method, amount: booking.totalAmount, currency: flight.currency, status: 'pending',
+    })
+
+    tx = paymentProviderClient(providerConfig).initiateTransaction(booking.totalAmount, method)
+    db.transactions.update(txn.id, { providerTransactionId: tx.id })
     return { bookingId: booking.id, txSecret: tx.secret }  // client completes payment with tx.secret
 
 function onPaymentWebhook(event):
+    txn = db.transactions.findByProviderTransactionId(event.providerTransactionId)
+    payment = db.payments.find(txn.paymentId)
+
     if event.status == 'success':
-        booking = db.flightBookings.update(event.bookingId, { status: 'confirmed' })
+        db.transactions.update(txn.id, { status: 'completed', rawResponse: event.raw })
+        db.payments.update(payment.id, { status: 'paid' })
+        booking = db.flightBookings.update(payment.bookingId, { status: 'confirmed' })
         audit.log('payment_success', booking)
         notification.sendReceipt(booking)
     else:
-        db.flightBookings.update(event.bookingId, { status: 'payment_failed' })
+        db.transactions.update(txn.id, { status: 'failed', rawResponse: event.raw })
+        db.payments.update(payment.id, { status: 'failed' })
+        db.flightBookings.update(payment.bookingId, { status: 'payment_failed' })
 ```
 
 ### 16.5 Refund
@@ -730,11 +832,11 @@ function onPaymentWebhook(event):
 flowchart TD
     A[POST /flight-bookings/:id/refund] --> B{Booking is paid & refundable?}
     B -->|No| C[Reject: not eligible]
-    B -->|Yes| D[Create refund record: status=processing]
-    D --> E[Call payment provider refund API]
+    B -->|Yes| D[Create TRANSACTIONS row: type=refund, status=processing]
+    D --> E[Call payment provider refund API via stored PAYMENT_PROVIDERS config]
     E --> F{Provider confirms refund?}
-    F -->|Yes| G[Update refund & booking status = refunded]
-    F -->|No| H[Mark refund failed, alert support]
+    F -->|Yes| G[Update transaction + payment + booking status = refunded]
+    F -->|No| H[Mark transaction failed, alert support]
     G --> I[Audit log + notify customer]
 ```
 
@@ -747,10 +849,11 @@ sequenceDiagram
 
     U->>A: POST /flight-bookings/:id/refund
     A->>D: Check booking status & refund eligibility
-    A->>D: Create refund (status=processing)
-    A->>P: Request refund
-    P-->>A: Refund confirmation
-    A->>D: Update refund & booking status
+    A->>D: Load PAYMENTS row + PAYMENT_PROVIDERS config
+    A->>D: Create TRANSACTIONS row (type=refund, status=processing)
+    A->>P: Request refund (using provider config)
+    P-->>A: Refund confirmation + provider_transaction_id
+    A->>D: Update transaction, payment, booking status
     A-->>U: Refund result
 ```
 
@@ -760,19 +863,28 @@ function requestRefund(bookingId, reason):
     if booking.status != 'confirmed' or not isRefundable(booking):
         throw NotEligibleError
 
-    refund = db.refunds.create({ bookingId, amount: booking.totalAmount, status: 'processing' })
-    result = paymentProvider.refund(booking.paymentId, booking.totalAmount)
+    payment = db.payments.find(booking.paymentId)
+    provider = db.paymentProviders.find(payment.providerId)
+
+    txn = db.transactions.create({
+        paymentId: payment.id, providerId: provider.id,
+        type: 'refund', method: payment.method,
+        amount: booking.totalAmount, currency: payment.currency, status: 'processing',
+    })
+
+    result = paymentProviderClient(provider).refund(payment.providerTransactionId, booking.totalAmount)
 
     if result.success:
-        db.refunds.update(refund.id, { status: 'completed' })
+        db.transactions.update(txn.id, { status: 'completed', providerTransactionId: result.id, rawResponse: result.raw })
+        db.payments.update(payment.id, { status: 'refunded' })
         db.flightBookings.update(bookingId, { status: 'refunded' })
     else:
-        db.refunds.update(refund.id, { status: 'failed' })
-        alertSupportTeam(refund)
+        db.transactions.update(txn.id, { status: 'failed', rawResponse: result.raw })
+        alertSupportTeam(txn)
 
     audit.log('refund', booking, { before: booking.status, after: 'refunded' })
     notification.send(booking.userId, 'refund_result', result)
-    return refund
+    return txn
 ```
 
 ### 16.6 Change Flight Date/Time (Post-Payment Reschedule)
