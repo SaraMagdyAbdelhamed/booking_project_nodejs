@@ -672,11 +672,107 @@ Response:
 
 ## 16. Feature Flows & Pseudocode
 
-Flowchart, sequence diagram, and pseudocode per feature. Search Scatter-Gather flow and Flight Booking sequence are covered in [§8](#8-system-flow-search-scatter-gather) and [§9](#9-sequence-diagram-flight-booking-pipeline) — pseudocode for those is included here for completeness.
+Flowchart, sequence diagram, and pseudocode per feature, in the same order as [§4 Functional Requirements](#4-functional-requirements-frs).
 
-### 16.1 Multi-Provider Search (Scatter-Gather)
+### 16.1 Auth & Profiles
+
+```mermaid
+flowchart TD
+    A[POST /auth/register or /auth/login] --> B{Local or OAuth?}
+    B -->|Local| C[Validate email/password]
+    B -->|OAuth Google/Keycloak| D[Redirect to provider consent]
+    D --> E[Provider callback with auth code]
+    E --> F[Exchange code for provider profile]
+    C --> G{User exists?}
+    F --> G
+    G -->|No| H[Create user record]
+    G -->|Yes| I[Load user record]
+    H --> J[Issue JWT access + refresh token]
+    I --> J
+    J --> K[Client stores token, sends on future requests]
+```
+
+```mermaid
+sequenceDiagram
+    participant U as User/Next.js
+    participant A as NestJS API
+    participant O as OAuth Provider (Google/Keycloak)
+    participant D as PostgreSQL
+
+    U->>A: GET /auth/oauth/google
+    A-->>U: Redirect to Google consent screen
+    U->>O: Approve access
+    O-->>A: Callback with auth code
+    A->>O: Exchange code for profile + tokens
+    O-->>A: Google profile (email, name, sub)
+    A->>D: Find or create user by email
+    D-->>A: User record
+    A-->>U: JWT access token + refresh token (httpOnly cookie)
+```
+
+```
+function login(email, password):
+    user = db.users.findByEmail(email)
+    if !user or !bcrypt.compare(password, user.passwordHash):
+        throw InvalidCredentialsError
+    return issueTokens(user)
+
+function oauthCallback(provider, code):
+    profile = oauthClient(provider).exchangeCodeForProfile(code)  // Google/Keycloak
+    user = db.users.findByEmail(profile.email)
+    if !user:
+        user = db.users.create({ email: profile.email, passwordHash: null, oauthProvider: provider })
+    return issueTokens(user)
+
+function issueTokens(user):
+    accessToken = jwt.sign({ sub: user.id, email: user.email }, ttl='15m')
+    refreshToken = jwt.sign({ sub: user.id }, ttl='30d')
+    db.refreshTokens.store(user.id, refreshToken)
+    return { accessToken, refreshToken }
+
+// NestJS Guard on protected routes
+function jwtAuthGuard(request):
+    token = extractBearerToken(request)
+    payload = jwt.verify(token)  // throws if expired/invalid
+    request.user = db.users.find(payload.sub)
+    return true
+
+function updateProfile(userId, updates):
+    audit.log('profile_update', { userId, before: db.users.find(userId), after: updates })
+    return db.users.update(userId, updates)
+```
+
+### 16.2 Multi-Provider Search (Scatter-Gather)
 
 See flowchart in [§8](#8-system-flow-search-scatter-gather).
+
+```mermaid
+sequenceDiagram
+    participant U as User/Next.js
+    participant A as NestJS API
+    participant R as Redis
+    participant Am as Amadeus
+    participant Du as Duffel
+    participant Te as Tequila
+
+    U->>A: GET /search/flights?origin=CAI&destination=DXB&...
+    A->>R: Check cache
+    alt cache hit
+        R-->>A: Cached results
+    else cache miss
+        par fan-out
+            A->>Am: search(query)
+            A->>Du: search(query)
+            A->>Te: search(query)
+        end
+        Am-->>A: offers (or timeout/error, isolated)
+        Du-->>A: offers
+        Te-->>A: offers
+        A->>A: Dedupe + normalize
+        A->>R: Cache normalized results (ttl 5min)
+    end
+    A-->>U: Flight offers
+```
 
 ```
 function searchFlights(query):
@@ -699,7 +795,7 @@ function searchFlights(query):
     return normalized
 ```
 
-### 16.2 AI Natural-Language Search
+### 16.3 AI Natural-Language Search
 
 ```mermaid
 flowchart TD
@@ -710,6 +806,25 @@ flowchart TD
     D -->|Yes| F[Build structured search params]
     F --> G[Run normal Scatter-Gather search]
     G --> H[Return parsed params + results]
+```
+
+```mermaid
+sequenceDiagram
+    participant U as User/Next.js
+    participant A as NestJS API
+    participant L as LLM
+    participant S as Search Service
+
+    U->>A: POST /search/ai { query: "cheap flight to Dubai next weekend, direct only" }
+    A->>L: Extract structured params from free text
+    L-->>A: { origin, destination, dates, stops, confidence }
+    alt confidence too low
+        A-->>U: Clarifying questions
+    else confident
+        A->>S: searchFlights(parsed params)
+        S-->>A: Results
+        A-->>U: { parsed, results }
+    end
 ```
 
 ```
@@ -724,7 +839,37 @@ function aiSearch(freeTextQuery):
     return { parsed, results }
 ```
 
-### 16.3 Whole-Month Price View
+### 16.4 Fixed-Date Price Search
+
+```mermaid
+flowchart TD
+    A[User picks exact travel date] --> B[GET /search/flights?departureDate=fixed]
+    B --> C[Run Scatter-Gather search for that date]
+    C --> D[Sort results by price ascending]
+    D --> E[User compares & picks one offer]
+    E --> F[Proceed to booking with chosen providerOfferId]
+```
+
+```mermaid
+sequenceDiagram
+    participant U as User/Next.js
+    participant A as NestJS API
+    participant S as Search Service (Scatter-Gather)
+
+    U->>A: GET /search/flights?departureDate=2026-09-01&...
+    A->>S: searchFlights(query)
+    S-->>A: Normalized offers from all providers
+    A-->>U: Offers sorted by price
+    U->>A: Select offer -> proceed to booking
+```
+
+```
+function fixedDateSearch(origin, destination, departureDate, passengers):
+    results = searchFlights({ origin, destination, departureDate, passengers })
+    return results.sortBy(price => price, 'asc')
+```
+
+### 16.5 Whole-Month Price View
 
 ```mermaid
 flowchart TD
@@ -734,6 +879,28 @@ flowchart TD
     D --> E[Take lowest price per day]
     E --> F[Cache calendar in Redis, longer TTL]
     F --> G[Return day -> lowestPrice list]
+```
+
+```mermaid
+sequenceDiagram
+    participant U as User/Next.js
+    participant A as NestJS API
+    participant R as Redis
+    participant S as Search Service (per-day)
+
+    U->>A: GET /search/flights/month?origin=CAI&destination=DXB&month=2026-09
+    A->>R: Check cached calendar
+    alt cache hit
+        R-->>A: Cached day->price list
+    else cache miss
+        loop for each day in month
+            A->>S: searchFlights({ ...route, departureDate: day })
+            S-->>A: Offers for that day
+        end
+        A->>A: Take lowest price per day
+        A->>R: Cache calendar (ttl 1h)
+    end
+    A-->>U: Calendar of lowest prices
 ```
 
 ```
@@ -751,19 +918,62 @@ function monthPriceView(origin, destination, month, airline):
     return calendar
 ```
 
-### 16.4 Flight Booking & Payment
+### 16.6 Filtering & Sorting
 
-See sequence diagram in [§9](#9-sequence-diagram-flight-booking-pipeline).
+```mermaid
+flowchart TD
+    A[Client sends filter/sort params<br/>with search request or after] --> B[Load raw provider results<br/>from cache/scatter-gather]
+    B --> C[Apply filters: price range, cabin class, stops, rating, departure window]
+    C --> D[Apply sort: price/duration/rating asc or desc]
+    D --> E[Return filtered + sorted list]
+```
+
+```mermaid
+sequenceDiagram
+    participant U as User/Next.js
+    participant A as NestJS API
+    participant S as Search Service
+
+    U->>A: GET /search/flights?...&maxStops=0&minRating=4&sort=price_asc
+    A->>S: searchFlights(query) -> raw normalized offers
+    A->>A: filterAndSort(offers, filters, sort)
+    A-->>U: Filtered + sorted offers
+```
 
 ```
-function bookFlight(providerOfferId, userId, seatNumber, method, provider):
-    offer = redis.get(providerOfferId) ?? externalProvider.fetchOffer(providerOfferId)  // no DB lookup, comes from search cache/live provider
-    if offer.isStale:
-        offer = revalidateWithProvider(offer)  // reprice/re-check availability before locking it in
+function filterAndSort(offers, filters, sort):
+    filtered = offers.filter(o =>
+        (filters.maxPrice == null or o.price <= filters.maxPrice) and
+        (filters.cabinClass == null or o.cabinClass == filters.cabinClass) and
+        (filters.maxStops == null or o.stops <= filters.maxStops) and
+        (filters.minRating == null or o.rating >= filters.minRating) and
+        (filters.departureWindow == null or withinWindow(o.departureTime, filters.departureWindow))
+    )
 
-    booking = db.flightBookings.create({
-        userId,
-        provider: offer.provider, providerOfferId: offer.id,
+    return filtered.sortBy(sort.field, sort.direction)  // e.g. price/asc, duration/asc, rating/desc
+```
+
+### 16.7 Separate Entity Bookings (Flight & Hotel Booking Creation)
+
+```mermaid
+flowchart TD
+    A[Client picks type: flight or hotel] --> B{Booking type}
+    B -->|Flight| C[POST /flight-bookings]
+    B -->|Hotel| D[POST /hotel-bookings]
+    C --> E[Fetch offer from Redis/live provider]
+    D --> E
+    E --> F[Snapshot provider details into booking row]
+    F --> G[Create row in flight_bookings or hotel_bookings<br/>status=pending_payment]
+    G --> H[Proceed to Payment]
+```
+
+See sequence diagram in [§9](#9-sequence-diagram-flight-booking-pipeline) (flight case; hotel case is structurally identical against `hotel_bookings`).
+
+```
+function createFlightBooking(providerOfferId, userId, seatNumber):
+    offer = fetchOffer(providerOfferId)  // Redis cache or live provider re-fetch
+    return db.flightBookings.create({
+        userId, provider: offer.provider, providerOfferId: offer.id,
         airlineCode: offer.airlineCode, flightNumber: offer.flightNumber,
         departureAirport: offer.departureAirport, arrivalAirport: offer.arrivalAirport,
         departureTime: offer.departureTime, arrivalTime: offer.arrivalTime,
@@ -771,37 +981,86 @@ function bookFlight(providerOfferId, userId, seatNumber, method, provider):
         totalAmount: offer.price, currency: offer.currency, status: 'pending_payment',
     })
 
-    providerConfig = db.paymentProviders.findByName(provider)  // e.g. Stripe/PayMob, config incl. vault key refs
+function createHotelBooking(providerOfferId, userId, checkInDate, checkOutDate):
+    offer = fetchOffer(providerOfferId)
+    return db.hotelBookings.create({
+        userId, provider: offer.provider, providerOfferId: offer.id,
+        hotelName: offer.hotelName, roomType: offer.roomType, stars: offer.stars,
+        freeCancellation: offer.freeCancellation, checkInDate, checkOutDate,
+        totalAmount: offer.pricePerNight * nights(checkInDate, checkOutDate),
+        currency: offer.currency, status: 'pending_payment',
+    })
+```
+
+### 16.8 Payment Integration
+
+```mermaid
+flowchart TD
+    A[Booking created, status=pending_payment] --> B[Client selects payment method + provider]
+    B --> C[Create PAYMENTS row + TRANSACTIONS row type=authorize]
+    C --> D[Call chosen provider's initiate-transaction API]
+    D --> E[Client completes payment on provider's side]
+    E --> F[Provider sends webhook]
+    F --> G{Webhook status}
+    G -->|success| H[Mark transaction/payment/booking confirmed, send receipt]
+    G -->|failure| I[Mark transaction/payment/booking failed]
+```
+
+```mermaid
+sequenceDiagram
+    participant U as User/Next.js
+    participant A as NestJS API
+    participant P as Payment Provider (Stripe/PayMob/...)
+    participant D as PostgreSQL
+
+    U->>A: Choose method (card/wallet/bank) + provider
+    A->>D: Load PAYMENT_PROVIDERS config for chosen provider
+    A->>D: Create PAYMENTS + TRANSACTIONS (type=authorize)
+    A->>P: Initiate transaction
+    P-->>A: Client secret / redirect URL
+    A-->>U: Render provider's payment UI
+    U->>P: Complete payment
+    P-->>A: Webhook (success/failure)
+    A->>D: Update transaction, payment, booking status
+    A-->>U: Booking confirmation
+```
+
+```
+function initiatePayment(bookingType, bookingId, method, providerName):
+    booking = db[bookingType + 'Bookings'].find(bookingId)
+    providerConfig = db.paymentProviders.findByName(providerName)  // credentials via vault refs in config
+
     payment = db.payments.create({
-        bookingType: 'flight', bookingId: booking.id, providerId: providerConfig.id,
-        amount: booking.totalAmount, currency: offer.currency, status: 'pending',
+        bookingType, bookingId, providerId: providerConfig.id,
+        amount: booking.totalAmount, currency: booking.currency, status: 'pending',
     })
     txn = db.transactions.create({
         paymentId: payment.id, providerId: providerConfig.id,
-        type: 'authorize', method, amount: booking.totalAmount, currency: offer.currency, status: 'pending',
+        type: 'authorize', method, amount: booking.totalAmount, currency: booking.currency, status: 'pending',
     })
 
     tx = paymentProviderClient(providerConfig).initiateTransaction(booking.totalAmount, method)
     db.transactions.update(txn.id, { providerTransactionId: tx.id })
-    return { bookingId: booking.id, txSecret: tx.secret }  // client completes payment with tx.secret
+    return { paymentId: payment.id, txSecret: tx.secret }
 
 function onPaymentWebhook(event):
     txn = db.transactions.findByProviderTransactionId(event.providerTransactionId)
     payment = db.payments.find(txn.paymentId)
+    bookingTable = db[payment.bookingType + 'Bookings']
 
     if event.status == 'success':
         db.transactions.update(txn.id, { status: 'completed', rawResponse: event.raw })
         db.payments.update(payment.id, { status: 'paid' })
-        booking = db.flightBookings.update(payment.bookingId, { status: 'confirmed' })
+        booking = bookingTable.update(payment.bookingId, { status: 'confirmed' })
         audit.log('payment_success', booking)
         notification.sendReceipt(booking)
     else:
         db.transactions.update(txn.id, { status: 'failed', rawResponse: event.raw })
         db.payments.update(payment.id, { status: 'failed' })
-        db.flightBookings.update(payment.bookingId, { status: 'payment_failed' })
+        bookingTable.update(payment.bookingId, { status: 'payment_failed' })
 ```
 
-### 16.5 Refund
+### 16.9 Refunds
 
 ```mermaid
 flowchart TD
@@ -863,7 +1122,7 @@ function requestRefund(bookingId, reason):
     return txn
 ```
 
-### 16.6 Change Flight Date/Time (Post-Payment Reschedule)
+### 16.10 Post-Payment Change (Reschedule)
 
 ```mermaid
 flowchart TD
@@ -929,7 +1188,145 @@ function rescheduleBooking(bookingId, newDepartureTime, newArrivalTime):
     return { bookingId, status: 'confirmed', priceDifference: diff }
 ```
 
-### 16.7 Favorites & Price-Watch Notification
+### 16.11 Notifications
+
+```mermaid
+flowchart TD
+    A[Domain event: booking confirmed,<br/>refund done, price drop, ticket update, etc] --> B[Enqueue notification job in BullMQ]
+    B --> C[Notification Worker picks up job]
+    C --> D{Channel}
+    D -->|Email| E[Send via email provider]
+    D -->|SMS| F[Send via SMS provider]
+    E --> G[Write NOTIFICATIONS row: sent/failed]
+    F --> G
+```
+
+```mermaid
+sequenceDiagram
+    participant S as Service (booking/payment/refund/etc)
+    participant Q as BullMQ Queue
+    participant W as Notification Worker
+    participant P as Email/SMS Provider
+    participant D as PostgreSQL
+
+    S->>Q: enqueue({ userId, channel, template, payload })
+    Q->>W: deliver job
+    W->>P: send(channel, recipient, renderedMessage)
+    P-->>W: delivery result
+    W->>D: insert NOTIFICATIONS row (channel, recipient, payload, status)
+```
+
+```
+function notify(userId, channel, template, payload):
+    queue.enqueue('notifications', { userId, channel, template, payload })
+
+// BullMQ worker
+function notificationWorker(job):
+    user = db.users.find(job.userId)
+    recipient = job.channel == 'email' ? user.email : user.phone
+    message = renderTemplate(job.template, job.payload)
+
+    result = channelProvider(job.channel).send(recipient, message)
+
+    db.notifications.create({
+        userId: job.userId, channel: job.channel, recipient,
+        payload: message, status: result.success ? 'sent' : 'failed',
+    })
+```
+
+### 16.12 Reporting
+
+```mermaid
+flowchart TD
+    A[Admin opens dashboard] --> B[GET /admin/reports?range=daily|monthly]
+    B --> C{Cached for this range?}
+    C -->|Yes| D[Return cached metrics]
+    C -->|No| E[Aggregate query: bookings, cancellations, revenue]
+    E --> F[Cache result, short TTL]
+    F --> G[Return metrics]
+```
+
+```mermaid
+sequenceDiagram
+    participant Ad as Admin/Next.js
+    participant A as NestJS API
+    participant R as Redis
+    participant D as PostgreSQL
+
+    Ad->>A: GET /admin/reports?range=monthly
+    A->>R: Check cached report
+    alt cache hit
+        R-->>A: Cached metrics
+    else cache miss
+        A->>D: Aggregate bookings/cancellations/revenue for range
+        D-->>A: Aggregated rows
+        A->>R: Cache (ttl=5min)
+    end
+    A-->>Ad: Dashboard metrics
+```
+
+```
+function getDashboardMetrics(range):  // range = 'daily' | 'monthly'
+    cacheKey = 'report:' + range
+    cached = redis.get(cacheKey)
+    if cached exists:
+        return cached
+
+    bookingsCount = db.flightBookings.count({ createdAt: withinRange(range) })
+                  + db.hotelBookings.count({ createdAt: withinRange(range) })
+    cancellations = db.flightBookings.count({ status: 'refunded', createdAt: withinRange(range) })
+                  + db.hotelBookings.count({ status: 'refunded', createdAt: withinRange(range) })
+    revenue = db.payments.sum('amount', { status: 'paid', createdAt: withinRange(range) })
+
+    metrics = { bookingsCount, cancellations, revenue, range }
+    redis.set(cacheKey, metrics, ttl=5min)
+    return metrics
+```
+
+### 16.13 Customer Support
+
+```mermaid
+flowchart TD
+    A[POST /support/tickets] --> B[Create ticket: status=open, linked to userId/bookingId]
+    B --> C[Notify support queue]
+    C --> D[Support Agent picks up ticket]
+    D --> E{Resolved?}
+    E -->|No| F[Agent replies / escalates]
+    F --> D
+    E -->|Yes| G[Close ticket, notify customer]
+```
+
+```mermaid
+sequenceDiagram
+    participant U as Customer
+    participant A as NestJS API
+    participant Q as Support Queue
+    participant Ag as Support Agent
+    participant D as PostgreSQL
+
+    U->>A: POST /support/tickets { bookingId, subject, message }
+    A->>D: Create ticket (status=open)
+    A->>Q: Notify support queue
+    Q-->>Ag: New ticket alert
+    Ag->>A: PATCH /support/tickets/:id (reply/resolve)
+    A->>D: Update ticket
+    A-->>U: Notification: ticket updated/resolved
+```
+
+```
+function createSupportTicket(userId, bookingId, subject, message):
+    ticket = db.tickets.create({ userId, bookingId, subject, message, status: 'open' })
+    notification.notifySupportQueue(ticket)
+    audit.log('support_ticket_created', ticket)
+    return ticket
+
+function resolveTicket(ticketId, agentId, resolution):
+    ticket = db.tickets.update(ticketId, { status: 'closed', resolution, resolvedBy: agentId })
+    notification.send(ticket.userId, 'ticket_resolved')
+    audit.log('support_ticket_resolved', ticket, { before: 'open', after: 'closed' })
+```
+
+### 16.14 Favorites & Price-Watch Notification
 
 ```mermaid
 flowchart TD
@@ -941,6 +1338,28 @@ flowchart TD
     F --> G{currentPrice <= targetPrice?}
     G -->|Yes| H[Send price-drop notification]
     G -->|No| I[Skip]
+```
+
+```mermaid
+sequenceDiagram
+    participant U as Customer
+    participant A as NestJS API
+    participant D as PostgreSQL
+    participant Sch as Scheduler (BullMQ repeatable job)
+    participant S as Search Service
+
+    U->>A: POST /favorites { type, providerOfferId, targetPrice }
+    A->>D: Create FAVORITES row (with snapshot)
+    A-->>U: Saved
+
+    loop every N minutes
+        Sch->>D: Load favorites with targetPrice set
+        Sch->>S: searchFlights(favorite.snapshot.route)
+        S-->>Sch: Current lowest price
+        alt price <= targetPrice
+            Sch->>U: Notify price drop
+        end
+    end
 ```
 
 ```
@@ -957,33 +1376,7 @@ function checkPriceWatches():
             notification.send(watch.userId, 'price_drop', { watch, currentPrice })
 ```
 
-### 16.8 Customer Support Ticket
-
-```mermaid
-flowchart TD
-    A[POST /support/tickets] --> B[Create ticket: status=open, linked to userId/bookingId]
-    B --> C[Notify support queue]
-    C --> D[Support Agent picks up ticket]
-    D --> E{Resolved?}
-    E -->|No| F[Agent replies / escalates]
-    F --> D
-    E -->|Yes| G[Close ticket, notify customer]
-```
-
-```
-function createSupportTicket(userId, bookingId, subject, message):
-    ticket = db.tickets.create({ userId, bookingId, subject, message, status: 'open' })
-    notification.notifySupportQueue(ticket)
-    audit.log('support_ticket_created', ticket)
-    return ticket
-
-function resolveTicket(ticketId, agentId, resolution):
-    ticket = db.tickets.update(ticketId, { status: 'closed', resolution, resolvedBy: agentId })
-    notification.send(ticket.userId, 'ticket_resolved')
-    audit.log('support_ticket_resolved', ticket, { before: 'open', after: 'closed' })
-```
-
-### 16.9 Auditing & Logging
+### 16.15 Auditing & Logging
 
 ```mermaid
 flowchart TD
