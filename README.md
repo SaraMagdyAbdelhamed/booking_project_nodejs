@@ -21,6 +21,7 @@ Software Architecture Document
 15. [API Documentation](#15-api-documentation)
 16. [Feature Flows & Pseudocode](#16-feature-flows--pseudocode)
 17. [Testing Suite Setup](#17-testing-suite-setup)
+18. [External Provider Integrations](#18-external-provider-integrations)
 
 ## 1. Overview
 
@@ -1483,3 +1484,45 @@ npm run test
 # Run End-to-End Tests
 npm run test:e2e
 ```
+
+## 18. External Provider Integrations
+
+For testing/development, this project integrates against **Duffel** (flights) and **LiteAPI** (hotels) — both offer sandbox/test-mode credentials, so no real airline/hotel inventory or payment is touched during development.
+
+### 18.1 Duffel (Flights) — [duffel.com/docs](https://duffel.com/docs)
+
+Base URL: `https://api.duffel.com` · Auth: `Authorization: Bearer <DUFFEL_ACCESS_TOKEN>` (test token in sandbox) · Required header: `Duffel-Version: v2`
+
+| Step | Method & Path | Purpose |
+|---|---|---|
+| 1. Search | `POST /air/offer_requests` | Create an offer request (origin/destination/dates/passengers) to search flights |
+| 2. Retrieve search | `GET /air/offer_requests/{id}` | Fetch a previously created offer request |
+| 3. Reprice | `GET /air/offers/{id}` | Get the latest version of an offer to confirm current price before booking |
+| 4. Book | `POST /air/orders` | Create an order (finalize booking) with passenger details and payment |
+| 5. Change (quote) | `POST /air/order-change-requests` | Submit slices to remove/add for a reschedule, get change offers |
+| 6. Change (confirm) | `POST /air/order-changes/{id}/confirm` | Confirm and pay for the selected order change |
+| 7. Cancel (quote) | `POST /air/order_cancellations` | Get an unconfirmed cancellation quote (refund amount/conditions) |
+| 8. Cancel (confirm) | `POST /air/order_cancellations/{id}/actions/confirm` | Confirm the cancellation |
+| Webhooks | — | Duffel pushes order/payment events (see [Receiving Webhooks](https://duffel.com/docs/guides/receiving-webhooks)) instead of polling |
+
+Maps onto this project's flow as: step 1–3 → [§16.2 Multi-Provider Search](#162-multi-provider-search-scatter-gather), step 4 → [§16.7 Booking Creation](#167-separate-entity-bookings-flight--hotel-booking-creation), steps 5–6 → [§16.10 Reschedule](#1610-post-payment-change-reschedule), steps 7–8 → [§16.9 Refunds](#169-refunds).
+
+### 18.2 LiteAPI (Hotels) — [docs.liteapi.travel](https://docs.liteapi.travel/reference/overview)
+
+Base URL: `https://api.liteapi.travel` · Auth: `X-API-Key: <LITEAPI_KEY>` (sandbox key for testing)
+
+| Step | Method & Path | Purpose |
+|---|---|---|
+| 1. Search | `POST /hotels/rates` | Get available hotel rates for a location/date range |
+| 1b. Cheapest-first | `POST /hotels/min-rates` | Get minimum rate per hotel (lighter-weight search) |
+| 2. Hold | `POST /rates/prebook` | Create a checkout session that holds a rate temporarily |
+| 3. Verify hold | `GET /prebooks/{prebookId}` | Retrieve prebook details (final price/conditions) before paying |
+| 4. Book | `POST /rates/book` | Complete the booking and charge payment |
+| 5. Retrieve | `GET /bookings/{bookingId}` | Get a specific booking's details |
+| 5b. List | `GET /bookings` | List all bookings |
+| 6. Cancel | `PUT /bookings/{bookingId}` | Cancel a booking |
+| 7. Amend | `PUT /bookings/{bookingId}/amend` | Change the guest name on a booking |
+| 7b. Amend dates | `POST /bookings/{bookingId}/alternative-prebooks` | Reschedule: get alternative prebooks for new dates/occupancy |
+| Content | `GET /data/hotels`, `GET /data/hotels/{hotelId}`, `GET /data/reviews` | Hotel details, amenities, and reviews (not booking-related) |
+
+Maps onto this project's flow as: steps 1–1b → [§16.2 Multi-Provider Search](#162-multi-provider-search-scatter-gather), steps 2–4 → [§16.7 Booking Creation](#167-separate-entity-bookings-flight--hotel-booking-creation), step 6 → [§16.9 Refunds](#169-refunds), steps 7–7b → [§16.10 Reschedule](#1610-post-payment-change-reschedule).
