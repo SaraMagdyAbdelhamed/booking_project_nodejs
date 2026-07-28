@@ -49,7 +49,7 @@ SkyBooking Engine is a high-concurrency Online Travel Agency (OTA) and travel se
 - **Fixed-Date Price Search:** User picks exact travel date, gets price comparison across all matching flights from all providers, picks the suitable one.
 - **Whole-Month Price View:** Skyscanner-style calendar showing cheapest price per day for an entire month, for a given route/airline, so user can pick the cheapest day to fly.
 - **Filtering & Sorting:** Filter/sort results returned from providers by price, cabin class, stops, ratings, and departure times.
-- **Separate Entity Bookings:** Distinct booking creation pipelines for flights (`flight_bookings`) and hotels (`hotel_bookings`).
+- **Separate Entity Bookings:** Distinct booking creation pipelines and tables for flights (`flight_bookings`) and hotels (`hotel_bookings`), each storing the provider offer snapshot alongside the booking.
 - **Payment Integration:** Multiple payment methods (card, wallet, bank transfer) via multiple payment providers/gateways (e.g. Stripe, PayMob), webhook verification, and receipt generation.
 - **Refunds:** Cancel a paid booking and trigger refund back through the original payment provider, with status tracking (requested/processing/completed).
 - **Post-Payment Change:** Change flight date/time on an already-paid booking — reprice against provider, charge/refund the difference, reissue confirmation.
@@ -69,11 +69,9 @@ SkyBooking Engine is a high-concurrency Online Travel Agency (OTA) and travel se
 
 ## 6. Entity Relationship Diagram (ERD)
 
-Approach: separate flight and hotel bookings into independent entity tables, without a common base entity table.
+Approach: separate `FLIGHT_BOOKINGS` and `HOTEL_BOOKINGS` tables, no common base table. Each table holds the booking itself *and* a snapshot of the provider's offer details (airline/flight or hotel/room info) directly as columns — there's no separate `FLIGHTS`/`HOTELS` catalog table to join through. The provider snapshot is captured at booking time (from the live search/Redis result), so the booking row is self-contained and immune to the provider later changing or removing that offer.
 
-`FLIGHTS` and `HOTELS` are a **provider offer cache**: every search result returned to a client is upserted here first (keyed by `provider` + `provider_offer_id`), so anything a user can book or favorite already has a real internal `id` backing it — bookings/favorites never point at a bare provider ID that isn't persisted. Offers expire (`expires_at`) since provider price/availability is only valid briefly; booking re-validates against the provider before confirming.
-
-`PAYMENT_PROVIDERS` holds per-provider config (Stripe, PayMob, etc) — credentials are stored as vault/secret-manager references inside `config`, never raw keys in the DB. `PAYMENTS` is the one logical payment per booking (aggregate status, which provider). `TRANSACTIONS` is the detail ledger under it — one row per attempt/event (authorize, capture, refund, retry), each carrying the provider's own transaction id and raw response for reconciliation. A payment can have many transactions; a refund is a new transaction row against the existing payment, not a new payment.
+`PAYMENT_PROVIDERS` holds per-provider config (Stripe, PayMob, etc) — credentials are stored as vault/secret-manager references inside `config`, never raw keys in the DB. `PAYMENTS` is the one logical payment per booking (aggregate status, which provider), linked polymorphically via `booking_type` + `booking_id` since a payment can belong to either booking table. `TRANSACTIONS` is the detail ledger under a payment — one row per attempt/event (authorize, capture, refund, retry), each carrying the provider's own transaction id and raw response for reconciliation. A refund is a new transaction row against the existing payment, not a new payment.
 
 ```mermaid
 erDiagram
@@ -82,10 +80,6 @@ erDiagram
     USERS ||--o{ NOTIFICATIONS : receives
     USERS ||--o{ FAVORITES : saves
     USERS ||--o{ AUDIT_LOGS : "acts (actor)"
-    FLIGHTS ||--o{ FLIGHT_BOOKINGS : "booked as"
-    HOTELS ||--o{ HOTEL_BOOKINGS : "booked as"
-    FLIGHTS ||--o{ FAVORITES : "saved (type=flight)"
-    HOTELS ||--o{ FAVORITES : "saved (type=hotel)"
     FLIGHT_BOOKINGS ||--o| PAYMENTS : "paid via"
     HOTEL_BOOKINGS ||--o| PAYMENTS : "paid via"
     PAYMENT_PROVIDERS ||--o{ PAYMENTS : processes
@@ -99,8 +93,9 @@ erDiagram
         datetime created_at
     }
 
-    FLIGHTS {
+    FLIGHT_BOOKINGS {
         int id PK
+        int user_id FK
         string provider
         string provider_offer_id
         string airline_code
@@ -110,50 +105,33 @@ erDiagram
         datetime departure_time
         datetime arrival_time
         string cabin_class
-        decimal price
+        string seat_number
+        decimal total_amount
         string currency
-        json raw_payload
-        datetime expires_at
+        string status
         datetime created_at
     }
 
-    HOTELS {
+    HOTEL_BOOKINGS {
         int id PK
+        int user_id FK
         string provider
         string provider_offer_id
         string hotel_name
         string room_type
         int stars
         boolean free_cancellation
-        decimal price_per_night
-        string currency
-        json raw_payload
-        datetime expires_at
-        datetime created_at
-    }
-
-    FLIGHT_BOOKINGS {
-        int id PK
-        int user_id FK
-        int flight_id FK
-        string seat_number
-        decimal total_amount
-        string status
-    }
-
-    HOTEL_BOOKINGS {
-        int id PK
-        int user_id FK
-        int hotel_id FK
         date check_in_date
         date check_out_date
         decimal total_amount
+        string currency
         string status
+        datetime created_at
     }
 
     PAYMENTS {
         int id PK
-        string booking_type FK
+        string booking_type
         int booking_id
         int provider_id FK
         decimal amount
@@ -197,8 +175,9 @@ erDiagram
         int id PK
         int user_id FK
         string type
-        int ref_id FK
+        string provider_offer_id
         decimal target_price
+        json snapshot
     }
 
     AUDIT_LOGS {
@@ -243,8 +222,7 @@ flowchart TD
     B -->|No| D[Fan-out Parallel Async Requests<br/>Amadeus, Duffel, Tequila]
     D --> E[Wait for Results OR 2.5s Timeout]
     E --> F[Deduplicate & Normalize]
-    F --> G[Upsert into FLIGHTS/HOTELS table<br/>by provider + provider_offer_id]
-    G --> H[Save to Redis & Return Response<br/>id = FLIGHTS/HOTELS.id]
+    F --> G[Save to Redis & Return Response<br/>id = provider_offer_id, not a DB row]
 ```
 
 ## 9. Sequence Diagram: Flight Booking Pipeline
@@ -263,7 +241,7 @@ sequenceDiagram
     U->>P: Complete Payment
     P-->>A: Webhook Success
     A->>D: Save Booking Data
-    Note over D: Create Record in flight_bookings
+    Note over D: Create Record in bookings (type=flight)
     A-->>U: Booking Confirm
 ```
 
@@ -272,8 +250,8 @@ sequenceDiagram
 - Suppliers return standardized ISO currency rates, or require local client-side handling.
 - Payment holds are finalized synchronously before confirming supplier bookings.
 - Redis is deployed with persistence enabled to survive restarts during cached search spikes.
-- Every search result is upserted into `FLIGHTS`/`HOTELS` (provider offer cache) before being returned, so the `id` a client books or favorites always exists in the DB — never a bare provider ID with nothing behind it.
-- Offers expire (`expires_at`); booking re-validates price/availability with the provider if the offer is stale rather than trusting the cached row blindly.
+- Search results are not persisted to a DB catalog table — only Redis-cached until a booking is made. On booking, the full provider offer snapshot (airline/flight or hotel/room fields) is copied directly into the `flight_bookings`/`hotel_bookings` row.
+- Provider price/availability is re-validated at booking time (Redis-cached offers can be stale relative to the live provider).
 
 ## 11. Tech Stack
 
@@ -300,8 +278,8 @@ skybooking-backend/
 │   │   │   ├── adapters/     # External API Integrations
 │   │   │   └── search.service.ts
 │   │   ├── ai-search/        # Free-Text Query -> Structured Search Params (LLM)
-│   │   ├── flight-booking/   # Flight Bookings Pipeline
-│   │   ├── hotel-booking/    # Hotel Bookings Pipeline
+│   │   ├── flight-booking/   # Flight Bookings (booking + provider snapshot)
+│   │   ├── hotel-booking/    # Hotel Bookings (booking + provider snapshot)
 │   │   ├── payment/          # Payment Webhooks & Auditing
 │   │   ├── notification/     # Queue Workers for Email/SMS
 │   │   ├── support/          # Customer Support Tickets & Chat
@@ -615,7 +593,7 @@ Body:
 {
   "userId": "usr_12345",
   "type": "flight",
-  "refId": "flg_982341",
+  "providerOfferId": "flg_982341",
   "targetPrice": 300.00
 }
 ```
@@ -626,7 +604,7 @@ Response:
 {
   "favoriteId": "fav_77120",
   "type": "flight",
-  "refId": "flg_982341",
+  "providerOfferId": "flg_982341",
   "targetPrice": 300.00,
   "createdAt": "2026-07-28T10:00:00Z"
 }
@@ -640,8 +618,8 @@ Response:
 
 ```json
 [
-  { "favoriteId": "fav_77120", "type": "flight", "refId": "flg_982341", "targetPrice": 300.00 },
-  { "favoriteId": "fav_77121", "type": "hotel", "refId": "htl_8821", "targetPrice": null }
+  { "favoriteId": "fav_77120", "type": "flight", "providerOfferId": "flg_982341", "targetPrice": 300.00 },
+  { "favoriteId": "fav_77121", "type": "hotel", "providerOfferId": "htl_8821", "targetPrice": null }
 ]
 ```
 
@@ -715,18 +693,10 @@ function searchFlights(query):
     results = awaitAllWithTimeout(promises, 2500ms)  // partial results on timeout
     merged = flatten(results)
     deduped = deduplicateByFlightSignature(merged)
-    normalized = normalizeToInternalSchema(deduped)
+    normalized = normalizeToInternalSchema(deduped)  // id = provider_offer_id, nothing written to DB yet
 
-    // persist so returned ids are real rows a client can book/favorite
-    saved = normalized.map(offer =>
-        db.flights.upsert(
-            { provider: offer.provider, providerOfferId: offer.externalId },
-            { ...offer, rawPayload: offer.raw, expiresAt: now() + 15min }
-        )
-    )
-
-    redis.set(cacheKey, saved, ttl=5min)
-    return saved
+    redis.set(cacheKey, normalized, ttl=5min)
+    return normalized
 ```
 
 ### 16.2 AI Natural-Language Search
@@ -786,24 +756,29 @@ function monthPriceView(origin, destination, month, airline):
 See sequence diagram in [§9](#9-sequence-diagram-flight-booking-pipeline).
 
 ```
-function bookFlight(flightId, userId, seatNumber, method, provider):
-    flight = db.flights.find(flightId)  // the persisted offer, not a bare provider id
-    if flight.expiresAt < now():
-        flight = revalidateWithProvider(flight)  // reprice/re-check availability, refresh row
+function bookFlight(providerOfferId, userId, seatNumber, method, provider):
+    offer = redis.get(providerOfferId) ?? externalProvider.fetchOffer(providerOfferId)  // no DB lookup, comes from search cache/live provider
+    if offer.isStale:
+        offer = revalidateWithProvider(offer)  // reprice/re-check availability before locking it in
 
     booking = db.flightBookings.create({
-        userId, flightId: flight.id, seatNumber,
-        totalAmount: flight.price, status: 'pending_payment',
+        userId,
+        provider: offer.provider, providerOfferId: offer.id,
+        airlineCode: offer.airlineCode, flightNumber: offer.flightNumber,
+        departureAirport: offer.departureAirport, arrivalAirport: offer.arrivalAirport,
+        departureTime: offer.departureTime, arrivalTime: offer.arrivalTime,
+        cabinClass: offer.cabinClass, seatNumber,
+        totalAmount: offer.price, currency: offer.currency, status: 'pending_payment',
     })
 
     providerConfig = db.paymentProviders.findByName(provider)  // e.g. Stripe/PayMob, config incl. vault key refs
     payment = db.payments.create({
         bookingType: 'flight', bookingId: booking.id, providerId: providerConfig.id,
-        amount: booking.totalAmount, currency: flight.currency, status: 'pending',
+        amount: booking.totalAmount, currency: offer.currency, status: 'pending',
     })
     txn = db.transactions.create({
         paymentId: payment.id, providerId: providerConfig.id,
-        type: 'authorize', method, amount: booking.totalAmount, currency: flight.currency, status: 'pending',
+        type: 'authorize', method, amount: booking.totalAmount, currency: offer.currency, status: 'pending',
     })
 
     tx = paymentProviderClient(providerConfig).initiateTransaction(booking.totalAmount, method)
@@ -863,16 +838,17 @@ function requestRefund(bookingId, reason):
     if booking.status != 'confirmed' or not isRefundable(booking):
         throw NotEligibleError
 
-    payment = db.payments.find(booking.paymentId)
+    payment = db.payments.findOne({ bookingType: 'flight', bookingId: booking.id })
     provider = db.paymentProviders.find(payment.providerId)
+    originalCharge = db.transactions.findOne({ paymentId: payment.id, type: 'authorize', status: 'completed' })
 
     txn = db.transactions.create({
         paymentId: payment.id, providerId: provider.id,
-        type: 'refund', method: payment.method,
+        type: 'refund', method: originalCharge.method,
         amount: booking.totalAmount, currency: payment.currency, status: 'processing',
     })
 
-    result = paymentProviderClient(provider).refund(payment.providerTransactionId, booking.totalAmount)
+    result = paymentProviderClient(provider).refund(originalCharge.providerTransactionId, booking.totalAmount)
 
     if result.success:
         db.transactions.update(txn.id, { status: 'completed', providerTransactionId: result.id, rawResponse: result.raw })
@@ -930,10 +906,16 @@ function rescheduleBooking(bookingId, newDepartureTime, newArrivalTime):
     newPrice = externalProvider.reprice(booking, newDepartureTime, newArrivalTime)
     diff = newPrice - booking.totalAmount
 
+    payment = db.payments.findOne({ bookingType: 'flight', bookingId: booking.id })
+    provider = db.paymentProviders.find(payment.providerId)
+    originalCharge = db.transactions.findOne({ paymentId: payment.id, type: 'authorize', status: 'completed' })
+
     if diff > 0:
-        paymentProvider.charge(booking.paymentMethod, diff)
+        db.transactions.create({ paymentId: payment.id, providerId: provider.id, type: 'charge', amount: diff, currency: booking.currency, status: 'processing' })
+        paymentProviderClient(provider).charge(originalCharge.providerTransactionId, diff)
     elif diff < 0:
-        paymentProvider.refund(booking.paymentId, abs(diff))
+        db.transactions.create({ paymentId: payment.id, providerId: provider.id, type: 'refund', amount: abs(diff), currency: booking.currency, status: 'processing' })
+        paymentProviderClient(provider).refund(originalCharge.providerTransactionId, abs(diff))
 
     db.flightBookings.update(bookingId, {
         departureTime: newDepartureTime,
@@ -951,7 +933,7 @@ function rescheduleBooking(bookingId, newDepartureTime, newArrivalTime):
 
 ```mermaid
 flowchart TD
-    A[POST /favorites] --> B[Save favorite: type, refId, targetPrice]
+    A[POST /favorites] --> B[Save favorite: type, providerOfferId, targetPrice, snapshot]
     B --> C[(Favorites table)]
 
     D[Scheduled job: every N minutes] --> E[For each price-watch favorite]
@@ -962,8 +944,9 @@ flowchart TD
 ```
 
 ```
-function addFavorite(userId, type, refId, targetPrice):
-    return db.favorites.create({ userId, type, refId, targetPrice, snapshot: fetchCurrentSnapshot(type, refId) })
+function addFavorite(userId, type, providerOfferId, targetPrice):
+    snapshot = fetchCurrentSnapshot(type, providerOfferId)  // from live search, not a DB catalog table
+    return db.favorites.create({ userId, type, providerOfferId, targetPrice, snapshot })
 
 // Runs on a schedule (BullMQ repeatable job)
 function checkPriceWatches():
