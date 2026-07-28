@@ -19,7 +19,8 @@ Software Architecture Document
 13. [Applied Design Patterns](#13-applied-design-patterns)
 14. [Setup & Installation Guide](#14-setup--installation-guide)
 15. [API Documentation](#15-api-documentation)
-16. [Testing Suite Setup](#16-testing-suite-setup)
+16. [Feature Flows & Pseudocode](#16-feature-flows--pseudocode)
+17. [Testing Suite Setup](#17-testing-suite-setup)
 
 ## 1. Overview
 
@@ -56,6 +57,7 @@ SkyBooking Engine is a high-concurrency Online Travel Agency (OTA) and travel se
 - **Reporting:** System-wide dashboard metrics tracking daily/monthly booking volume and cancellations.
 - **Customer Support:** Pre-booking (search/pricing questions) and post-booking (refund status, reschedule help, complaints) support via ticketing, live chat, or agent-assisted channel, linked to the customer's booking history.
 - **Favorites:** Registered customer saves flights, hotels, or price watches (route + target price) for quick access later; price-watch favorites can trigger a notification when the price drops.
+- **Auditing & Logging:** Every state-changing action (booking, payment, refund, reschedule, admin/support action) is written to an immutable audit log (who, what, when, before/after values); structured request/error logs shipped to a central log store for debugging and monitoring.
 
 ## 5. Non-Functional Requirements (NFRs)
 
@@ -63,6 +65,7 @@ SkyBooking Engine is a high-concurrency Online Travel Agency (OTA) and travel se
 - **Scalability:** Horizontal scaling for high read-to-write ratio during search queries.
 - **Security:** PCI-DSS compliant payment processing (tokenized via external providers), JWT authentication, rate limiting.
 - **Availability:** 99.9% uptime with circuit breakers on third-party API adapters.
+- **Auditability & Observability:** All financial and admin/support actions traceable via audit log; structured, correlation-ID-tagged logs across services for tracing a request end-to-end.
 
 ## 6. Entity Relationship Diagram (ERD)
 
@@ -74,6 +77,7 @@ erDiagram
     USERS ||--o{ HOTEL_BOOKINGS : places
     USERS ||--o{ NOTIFICATIONS : receives
     USERS ||--o{ FAVORITES : saves
+    USERS ||--o{ AUDIT_LOGS : "acts (actor)"
     FLIGHT_BOOKINGS ||--o| PAYMENTS : "paid via"
     HOTEL_BOOKINGS ||--o| PAYMENTS : "paid via"
 
@@ -129,6 +133,18 @@ erDiagram
         decimal target_price
         string snapshot
     }
+
+    AUDIT_LOGS {
+        int id PK
+        int actor_user_id FK
+        string action
+        string entity_type
+        string entity_id
+        string before_value
+        string after_value
+        string ip_address
+        datetime created_at
+    }
 ```
 
 ## 7. Core User Stories
@@ -149,6 +165,7 @@ erDiagram
 | US-12 | Guest | Type what I want in plain language instead of filling a search form | I get matching flights without learning form fields/filters. |
 | US-13 | Customer | Save a flight, hotel, or price watch to favorites | I can find it again without re-searching. |
 | US-14 | Customer | Get notified when a favorited route's price drops | I can book at the best time. |
+| US-15 | Admin | View an audit trail of who changed/refunded/rescheduled a booking and when | I can investigate disputes and detect abuse. |
 
 ## 8. System Flow: Search Scatter-Gather
 
@@ -200,6 +217,7 @@ sequenceDiagram
 | API Documentation | Swagger (@nestjs/swagger, OpenAPI) |
 | Testing | Jest |
 | AI Search | LLM (e.g. Claude/GPT) for parsing free-text queries into structured search params |
+| Logging & Auditing | Pino/Winston (structured logs) + NestJS Interceptor for audit trail, shipped to ELK/Loki |
 
 ## 12. Project Structure
 
@@ -217,8 +235,9 @@ skybooking-backend/
 │   │   ├── payment/          # Payment Webhooks & Auditing
 │   │   ├── notification/     # Queue Workers for Email/SMS
 │   │   ├── support/          # Customer Support Tickets & Chat
-│   │   └── favorites/        # Saved Flights, Hotels & Price Watches
-│   ├── common/               # Filters, Interceptors, Guards
+│   │   ├── favorites/        # Saved Flights, Hotels & Price Watches
+│   │   └── audit/            # Audit Log Writer & Query API
+│   ├── common/               # Filters, Interceptors (Audit, Logging), Guards
 │   └── main.ts
 └── prisma/
     └── schema.prisma
@@ -581,12 +600,390 @@ Response:
 }
 ```
 
-## 16. Testing Suite Setup
+### 12. Query Audit Logs
+
+`GET /api/v1/audit-logs?entityType=flight_booking&entityId=flg_982341`
+
+Response:
+
+```json
+[
+  {
+    "id": "aud_1001",
+    "actorUserId": "usr_12345",
+    "action": "reschedule",
+    "entityType": "flight_booking",
+    "entityId": "flg_982341",
+    "beforeValue": { "departureTime": "2026-09-01T08:00:00Z" },
+    "afterValue": { "departureTime": "2026-09-05T08:00:00Z" },
+    "ipAddress": "203.0.113.10",
+    "createdAt": "2026-09-02T09:15:00Z"
+  }
+]
+```
+
+## 16. Feature Flows & Pseudocode
+
+Flowchart, sequence diagram, and pseudocode per feature. Search Scatter-Gather flow and Flight Booking sequence are covered in [§8](#8-system-flow-search-scatter-gather) and [§9](#9-sequence-diagram-flight-booking-pipeline) — pseudocode for those is included here for completeness.
+
+### 16.1 Multi-Provider Search (Scatter-Gather)
+
+See flowchart in [§8](#8-system-flow-search-scatter-gather).
+
+```
+function searchFlights(query):
+    cacheKey = hash(query)
+    cached = redis.get(cacheKey)
+    if cached exists:
+        return cached
+
+    providers = [Amadeus, Duffel, Tequila]
+    promises = []
+    for provider in providers:
+        promises.push(provider.search(query).catch(() => []))  // isolate provider failures
+
+    results = awaitAllWithTimeout(promises, 2500ms)  // partial results on timeout
+    merged = flatten(results)
+    deduped = deduplicateByFlightSignature(merged)
+    normalized = normalizeToInternalSchema(deduped)
+
+    redis.set(cacheKey, normalized, ttl=5min)
+    return normalized
+```
+
+### 16.2 AI Natural-Language Search
+
+```mermaid
+flowchart TD
+    A[User types free-text query] --> B[POST /search/ai]
+    B --> C[LLM: extract origin, destination, dates, filters]
+    C --> D{Parse confident enough?}
+    D -->|No| E[Ask user to clarify / show raw form]
+    D -->|Yes| F[Build structured search params]
+    F --> G[Run normal Scatter-Gather search]
+    G --> H[Return parsed params + results]
+```
+
+```
+function aiSearch(freeTextQuery):
+    prompt = buildExtractionPrompt(freeTextQuery)
+    parsed = llm.extract(prompt)  // { origin, destination, departureDate, returnDate, stops, cabinClass, sort }
+
+    if parsed.confidence < THRESHOLD:
+        return { needsClarification: true, questions: parsed.missingFields }
+
+    results = searchFlights(parsed)
+    return { parsed, results }
+```
+
+### 16.3 Whole-Month Price View
+
+```mermaid
+flowchart TD
+    A[GET /search/flights/month] --> B{Cached month prices?}
+    B -->|Yes| C[Return cached calendar]
+    B -->|No| D[For each day in month: fan-out provider search]
+    D --> E[Take lowest price per day]
+    E --> F[Cache calendar in Redis, longer TTL]
+    F --> G[Return day -> lowestPrice list]
+```
+
+```
+function monthPriceView(origin, destination, month, airline):
+    cacheKey = hash(origin, destination, month, airline)
+    cached = redis.get(cacheKey)
+    if cached exists:
+        return cached
+
+    days = allDaysIn(month)
+    results = parallelMap(days, day => searchFlights({ origin, destination, departureDate: day, airline }))
+    calendar = days.map(day => ({ date: day, lowestPrice: min(results[day].map(f => f.price)) }))
+
+    redis.set(cacheKey, calendar, ttl=1hour)
+    return calendar
+```
+
+### 16.4 Flight Booking & Payment
+
+See sequence diagram in [§9](#9-sequence-diagram-flight-booking-pipeline).
+
+```
+function bookFlight(payload):
+    flight = validateFlightStillAvailable(payload)
+    booking = db.flightBookings.create({ ...payload, status: 'pending_payment' })
+
+    tx = paymentProvider.initiateTransaction(booking.totalAmount, method, provider)
+    return { bookingId: booking.id, txSecret: tx.secret }  // client completes payment with tx.secret
+
+function onPaymentWebhook(event):
+    if event.status == 'success':
+        booking = db.flightBookings.update(event.bookingId, { status: 'confirmed' })
+        audit.log('payment_success', booking)
+        notification.sendReceipt(booking)
+    else:
+        db.flightBookings.update(event.bookingId, { status: 'payment_failed' })
+```
+
+### 16.5 Refund
+
+```mermaid
+flowchart TD
+    A[POST /flight-bookings/:id/refund] --> B{Booking is paid & refundable?}
+    B -->|No| C[Reject: not eligible]
+    B -->|Yes| D[Create refund record: status=processing]
+    D --> E[Call payment provider refund API]
+    E --> F{Provider confirms refund?}
+    F -->|Yes| G[Update refund & booking status = refunded]
+    F -->|No| H[Mark refund failed, alert support]
+    G --> I[Audit log + notify customer]
+```
+
+```mermaid
+sequenceDiagram
+    participant U as Customer
+    participant A as NestJS API
+    participant P as Payment Provider
+    participant D as PostgreSQL
+
+    U->>A: POST /flight-bookings/:id/refund
+    A->>D: Check booking status & refund eligibility
+    A->>D: Create refund (status=processing)
+    A->>P: Request refund
+    P-->>A: Refund confirmation
+    A->>D: Update refund & booking status
+    A-->>U: Refund result
+```
+
+```
+function requestRefund(bookingId, reason):
+    booking = db.flightBookings.find(bookingId)
+    if booking.status != 'confirmed' or not isRefundable(booking):
+        throw NotEligibleError
+
+    refund = db.refunds.create({ bookingId, amount: booking.totalAmount, status: 'processing' })
+    result = paymentProvider.refund(booking.paymentId, booking.totalAmount)
+
+    if result.success:
+        db.refunds.update(refund.id, { status: 'completed' })
+        db.flightBookings.update(bookingId, { status: 'refunded' })
+    else:
+        db.refunds.update(refund.id, { status: 'failed' })
+        alertSupportTeam(refund)
+
+    audit.log('refund', booking, { before: booking.status, after: 'refunded' })
+    notification.send(booking.userId, 'refund_result', result)
+    return refund
+```
+
+### 16.6 Change Flight Date/Time (Post-Payment Reschedule)
+
+```mermaid
+flowchart TD
+    A[PATCH /flight-bookings/:id/reschedule] --> B{Booking confirmed & changeable?}
+    B -->|No| C[Reject: not changeable]
+    B -->|Yes| D[Reprice new date/time with provider]
+    D --> E{Price difference}
+    E -->|Higher| F[Charge difference via payment provider]
+    E -->|Lower| G[Refund difference via payment provider]
+    E -->|Same| H[No charge]
+    F --> I[Update booking, reissue confirmation]
+    G --> I
+    H --> I
+```
+
+```mermaid
+sequenceDiagram
+    participant U as Customer
+    participant A as NestJS API
+    participant P as Payment Provider
+    participant Ext as External Provider (Amadeus/Duffel)
+    participant D as PostgreSQL
+
+    U->>A: PATCH /flight-bookings/:id/reschedule
+    A->>D: Load booking, verify changeable
+    A->>Ext: Reprice new date/time
+    Ext-->>A: New price
+    A->>P: Charge or refund price difference
+    P-->>A: Payment result
+    A->>D: Update booking (new time, status=confirmed)
+    A-->>U: Reschedule confirmation + price difference
+```
+
+```
+function rescheduleBooking(bookingId, newDepartureTime, newArrivalTime):
+    booking = db.flightBookings.find(bookingId)
+    if booking.status != 'confirmed' or not isChangeable(booking):
+        throw NotChangeableError
+
+    newPrice = externalProvider.reprice(booking, newDepartureTime, newArrivalTime)
+    diff = newPrice - booking.totalAmount
+
+    if diff > 0:
+        paymentProvider.charge(booking.paymentMethod, diff)
+    elif diff < 0:
+        paymentProvider.refund(booking.paymentId, abs(diff))
+
+    db.flightBookings.update(bookingId, {
+        departureTime: newDepartureTime,
+        arrivalTime: newArrivalTime,
+        totalAmount: newPrice,
+        status: 'confirmed',
+    })
+
+    audit.log('reschedule', booking, { before: booking.departureTime, after: newDepartureTime })
+    notification.send(booking.userId, 'reschedule_confirmed')
+    return { bookingId, status: 'confirmed', priceDifference: diff }
+```
+
+### 16.7 Favorites & Price-Watch Notification
+
+```mermaid
+flowchart TD
+    A[POST /favorites] --> B[Save favorite: type, refId, targetPrice]
+    B --> C[(Favorites table)]
+
+    D[Scheduled job: every N minutes] --> E[For each price-watch favorite]
+    E --> F[Re-run search for saved route]
+    F --> G{currentPrice <= targetPrice?}
+    G -->|Yes| H[Send price-drop notification]
+    G -->|No| I[Skip]
+```
+
+```
+function addFavorite(userId, type, refId, targetPrice):
+    return db.favorites.create({ userId, type, refId, targetPrice, snapshot: fetchCurrentSnapshot(type, refId) })
+
+// Runs on a schedule (BullMQ repeatable job)
+function checkPriceWatches():
+    watches = db.favorites.findAll({ targetPrice: notNull() })
+    for watch in watches:
+        currentPrice = searchFlights(watch.snapshot.route).minPrice()
+        if currentPrice <= watch.targetPrice:
+            notification.send(watch.userId, 'price_drop', { watch, currentPrice })
+```
+
+### 16.8 Customer Support Ticket
+
+```mermaid
+flowchart TD
+    A[POST /support/tickets] --> B[Create ticket: status=open, linked to userId/bookingId]
+    B --> C[Notify support queue]
+    C --> D[Support Agent picks up ticket]
+    D --> E{Resolved?}
+    E -->|No| F[Agent replies / escalates]
+    F --> D
+    E -->|Yes| G[Close ticket, notify customer]
+```
+
+```
+function createSupportTicket(userId, bookingId, subject, message):
+    ticket = db.tickets.create({ userId, bookingId, subject, message, status: 'open' })
+    notification.notifySupportQueue(ticket)
+    audit.log('support_ticket_created', ticket)
+    return ticket
+
+function resolveTicket(ticketId, agentId, resolution):
+    ticket = db.tickets.update(ticketId, { status: 'closed', resolution, resolvedBy: agentId })
+    notification.send(ticket.userId, 'ticket_resolved')
+    audit.log('support_ticket_resolved', ticket, { before: 'open', after: 'closed' })
+```
+
+### 16.9 Auditing & Logging
+
+```mermaid
+flowchart TD
+    A[Any state-changing request hits controller] --> B[Audit Interceptor wraps handler]
+    B --> C[Handler executes business logic]
+    C --> D{Success?}
+    D -->|Yes| E[Write audit_logs row: actor, action, before/after]
+    D -->|No| F[Write structured error log with correlation ID]
+    E --> G[Ship log line to ELK/Loki]
+    F --> G
+```
+
+```
+// NestJS Interceptor, wraps every write endpoint
+function auditInterceptor(context, next):
+    request = context.getRequest()
+    before = loadEntityStateIfApplicable(request)
+
+    result = next.handle()  // run the actual handler
+
+    result.subscribe(response => {
+        audit.log({
+            actorUserId: request.user.id,
+            action: request.method + ' ' + request.route,
+            entityType: inferEntityType(request),
+            entityId: response.id,
+            beforeValue: before,
+            afterValue: response,
+            ipAddress: request.ip,
+        })
+    })
+
+    return result
+
+function log(level, message, context):
+    logger.write({
+        level, message, ...context,
+        correlationId: currentRequestContext.correlationId,
+        timestamp: now(),
+    })  // shipped async to ELK/Loki
+```
+
+## 17. Testing Suite Setup
 
 ### Unit & Integration Testing (Jest)
 
 To test the parallel aggregator without hitting live APIs, mock supplier responses with Jest:
 
+```typescript
+// src/modules/search/search.service.spec.ts
+import { Test, TestingModule } from '@nestjs/testing';
+import { SearchService } from './search.service';
+import { HttpService } from '@nestjs/axios';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import { of } from 'rxjs';
+
+describe('SearchService (Scatter-Gather)', () => {
+  let service: SearchService;
+  let httpService: HttpService;
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        SearchService,
+        {
+          provide: HttpService,
+          useValue: {
+            get: jest.fn().mockReturnValue(of({ data: [] })),
+            post: jest.fn().mockReturnValue(of({ data: [] })),
+          },
+        },
+        {
+          provide: CACHE_MANAGER,
+          useValue: {
+            get: jest.fn().mockResolvedValue(null),
+            set: jest.fn().mockResolvedValue(true),
+          },
+        },
+      ],
+    }).compile();
+
+    service = module.get<SearchService>(SearchService);
+    httpService = module.get<HttpService>(HttpService);
+  });
+
+  it('should collect flight offers from providers concurrently', async () => {
+    const results = await service.searchFlights({
+      origin: 'CAI',
+      destination: 'DXB',
+      date: '2026-09-01',
+    });
+    expect(results).toBeDefined();
+    expect(Array.isArray(results)).toBe(true);
+  });
+});
 ```
 
 ### Running Tests
