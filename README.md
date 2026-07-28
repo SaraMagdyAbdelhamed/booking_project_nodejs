@@ -11,21 +11,19 @@ Software Architecture Document
 5. [Non-Functional Requirements (NFRs)](#5-non-functional-requirements-nfrs)
 6. [Entity Relationship Diagram (ERD)](#6-entity-relationship-diagram-erd)
 7. [Core User Stories](#7-core-user-stories)
-8. [System Flow: Search Scatter-Gather](#8-system-flow-search-scatter-gather)
-9. [Sequence Diagram: Flight Booking Pipeline](#9-sequence-diagram-flight-booking-pipeline)
-10. [System Assumptions](#10-system-assumptions)
-11. [Tech Stack](#11-tech-stack)
-12. [Project Structure](#12-project-structure)
-13. [Applied Design Patterns](#13-applied-design-patterns)
-14. [Setup & Installation Guide](#14-setup--installation-guide)
-15. [API Documentation](#15-api-documentation)
-16. [Feature Flows & Pseudocode](#16-feature-flows--pseudocode)
-17. [Testing Suite Setup](#17-testing-suite-setup)
-18. [External Provider Integrations](#18-external-provider-integrations)
+8. [System Assumptions](#8-system-assumptions)
+9. [Tech Stack](#9-tech-stack)
+10. [Project Structure](#10-project-structure)
+11. [Applied Design Patterns](#11-applied-design-patterns)
+12. [Setup & Installation Guide](#12-setup--installation-guide)
+13. [API Documentation](#13-api-documentation)
+14. [Feature Flows & Pseudocode](#14-feature-flows--pseudocode)
+15. [Testing Suite Setup](#15-testing-suite-setup)
+16. [External Provider Integrations](#16-external-provider-integrations)
 
 ## 1. Overview
 
-SkyBooking Engine is a high-concurrency Online Travel Agency (OTA) and travel search aggregator. It queries third-party travel providers (e.g. Amadeus, Duffel) in parallel, caches normalized results, and facilitates flight and hotel reservations with payment processing.
+SkyBooking Engine is a high-concurrency Online Travel Agency (OTA) and travel search aggregator. It queries third-party travel providers (Duffel and LiteAPI, both covering flights and hotels) in parallel, caches normalized results, and facilitates flight and hotel reservations with payment processing.
 
 ## 2. Vision & Mission
 
@@ -40,12 +38,12 @@ SkyBooking Engine is a high-concurrency Online Travel Agency (OTA) and travel se
 | Registered Customer | Authenticated user with saved profile data, booking history, and active reservations. |
 | Admin / Operations User | Internal manager auditing transactions, customer accounts, and daily revenue reporting. |
 | Support Agent | Internal user handling customer inquiries, complaints, refund/reschedule assistance, before and after booking. |
-| External Provider (System Actor) | External GDS / API integrations (e.g. Amadeus, Duffel, Stripe). |
+| External Provider (System Actor) | External API integrations: Duffel & LiteAPI (flights + hotels), Stripe/PayMob (payments). |
 
 ## 4. Functional Requirements (FRs)
 
 - **Auth & Profiles:** User registration, OAuth2 social login (Google/Keycloak), JWT token management, and profile updates.
-- **Multi-Provider Search:** Parallel (Scatter-Gather) execution querying flight and hotel APIs concurrently across multiple providers (Amadeus, Duffel, Tequila, etc).
+- **Multi-Provider Search:** Parallel (Scatter-Gather) execution querying flight and hotel APIs concurrently. Currently: Duffel and LiteAPI, both queried for both flights and hotels; architecture supports adding more providers later.
 - **AI Natural-Language Search:** User types free-text wish (e.g. "cheap flight to Dubai next weekend, direct only") instead of filling search form. LLM parses intent into structured search params (origin, destination, dates, filters), then runs normal scatter-gather search.
 - **Fixed-Date Price Search:** User picks exact travel date, gets price comparison across all matching flights from all providers, picks the suitable one.
 - **Whole-Month Price View:** Skyscanner-style calendar showing cheapest price per day for an entire month, for a given route/airline, so user can pick the cheapest day to fly.
@@ -214,39 +212,7 @@ erDiagram
 | US-14 | Customer | Get notified when a favorited route's price drops | I can book at the best time. |
 | US-15 | Admin | View an audit trail of who changed/refunded/rescheduled a booking and when | I can investigate disputes and detect abuse. |
 
-## 8. System Flow: Search Scatter-Gather
-
-```mermaid
-flowchart TD
-    A[Client: Request Search /search/flights] --> B{Check Redis Cache?}
-    B -->|Yes| C[Return Cached Data]
-    B -->|No| D[Fan-out Parallel Async Requests<br/>Amadeus, Duffel, Tequila]
-    D --> E[Wait for Results OR 2.5s Timeout]
-    E --> F[Deduplicate & Normalize]
-    F --> G[Save to Redis & Return Response<br/>id = provider_offer_id, not a DB row]
-```
-
-## 9. Sequence Diagram: Flight Booking Pipeline
-
-```mermaid
-sequenceDiagram
-    participant U as User/Next.js
-    participant A as NestJS API
-    participant P as Payment Provider
-    participant D as PostgreSQL
-
-    U->>A: Book Flight (Payload)
-    A->>P: Initiate Tx
-    P-->>A: Tx Secret
-    A-->>U: Render Payment
-    U->>P: Complete Payment
-    P-->>A: Webhook Success
-    A->>D: Save Booking Data
-    Note over D: Create Record in bookings (type=flight)
-    A-->>U: Booking Confirm
-```
-
-## 10. System Assumptions
+## 8. System Assumptions
 
 - Suppliers return standardized ISO currency rates, or require local client-side handling.
 - Payment holds are finalized synchronously before confirming supplier bookings.
@@ -254,7 +220,7 @@ sequenceDiagram
 - Search results are not persisted to a DB catalog table — only Redis-cached until a booking is made. On booking, the full provider offer snapshot (airline/flight or hotel/room fields) is copied directly into the `flight_bookings`/`hotel_bookings` row.
 - Provider price/availability is re-validated at booking time (Redis-cached offers can be stale relative to the live provider).
 
-## 11. Tech Stack
+## 9. Tech Stack
 
 | Layer | Technology |
 |---|---|
@@ -268,7 +234,7 @@ sequenceDiagram
 | AI Search | LLM (e.g. Claude/GPT) for parsing free-text queries into structured search params |
 | Logging & Auditing | Pino/Winston (structured logs) + NestJS Interceptor for audit trail, shipped to ELK/Loki |
 
-## 12. Project Structure
+## 10. Project Structure
 
 ```
 skybooking-backend/
@@ -292,14 +258,14 @@ skybooking-backend/
     └── schema.prisma
 ```
 
-## 13. Applied Design Patterns
+## 11. Applied Design Patterns
 
 - **Scatter-Gather Pattern:** Used in the Search module to fan-out queries to external APIs and aggregate the fastest responses.
-- **Adapter Pattern:** Used to translate third-party supplier responses (Amadeus, Duffel) into a normalized internal JSON payload.
+- **Adapter Pattern:** Used to translate third-party supplier responses (Duffel, LiteAPI) into a normalized internal JSON payload.
 - **Repository Pattern:** Provided natively by Prisma ORM for database abstraction.
 - **Factory / Module Pattern:** Applied via NestJS modular architecture.
 
-## 14. Setup & Installation Guide
+## 12. Setup & Installation Guide
 
 ### Prerequisites
 
@@ -355,7 +321,7 @@ cd ../skybooking-frontend
 npm run dev
 ```
 
-## 15. API Documentation
+## 13. API Documentation
 
 Swagger UI auto-generated via `@nestjs/swagger`, served at `/api/docs` when the backend runs.
 
@@ -410,7 +376,7 @@ Response:
     "arrivalTime": "2026-09-01T12:30:00Z",
     "price": 320.00,
     "currency": "USD",
-    "provider": "Amadeus"
+    "provider": "Duffel"
   }
 ]
 ```
@@ -516,7 +482,7 @@ Response (parsed params + results, same shape as `/search/flights`):
       "flightNumber": "MS777",
       "price": 320.00,
       "currency": "USD",
-      "provider": "Amadeus"
+      "provider": "LiteAPI"
     }
   ]
 }
@@ -671,11 +637,11 @@ Response:
 ]
 ```
 
-## 16. Feature Flows & Pseudocode
+## 14. Feature Flows & Pseudocode
 
 Flowchart, sequence diagram, and pseudocode per feature, in the same order as [§4 Functional Requirements](#4-functional-requirements-frs).
 
-### 16.1 Auth & Profiles
+### 14.1 Auth & Profiles
 
 ```mermaid
 flowchart TD
@@ -743,60 +709,67 @@ function updateProfile(userId, updates):
     return db.users.update(userId, updates)
 ```
 
-### 16.2 Multi-Provider Search (Scatter-Gather)
+### 14.2 Multi-Provider Search (Scatter-Gather)
 
-See flowchart in [§8](#8-system-flow-search-scatter-gather).
+Current providers: **Duffel** and **LiteAPI** — both cover flights and hotels, so search fans out to both providers for either search type. The adapter layer is provider-agnostic, so adding another provider later is a new adapter, not a rewrite.
+
+```mermaid
+flowchart TD
+    A[Client: Request Search /search/flights or /search/hotels] --> B{Check Redis Cache?}
+    B -->|Yes| C[Return Cached Data]
+    B -->|No| D[Fan-out Parallel Async Requests<br/>Duffel + LiteAPI]
+    D --> E[Wait for Results OR 2.5s Timeout]
+    E --> F[Deduplicate & Normalize]
+    F --> G[Save to Redis & Return Response<br/>id = provider_offer_id, not a DB row]
+```
 
 ```mermaid
 sequenceDiagram
     participant U as User/Next.js
     participant A as NestJS API
     participant R as Redis
-    participant Am as Amadeus
     participant Du as Duffel
-    participant Te as Tequila
+    participant Li as LiteAPI
 
-    U->>A: GET /search/flights?origin=CAI&destination=DXB&...
+    U->>A: GET /search/flights or /search/hotels
     A->>R: Check cache
     alt cache hit
         R-->>A: Cached results
     else cache miss
         par fan-out
-            A->>Am: search(query)
             A->>Du: search(query)
-            A->>Te: search(query)
+            A->>Li: search(query)
         end
-        Am-->>A: offers (or timeout/error, isolated)
-        Du-->>A: offers
-        Te-->>A: offers
+        Du-->>A: offers (or timeout/error, isolated)
+        Li-->>A: offers
         A->>A: Dedupe + normalize
         A->>R: Cache normalized results (ttl 5min)
     end
-    A-->>U: Flight offers
+    A-->>U: Offers
 ```
 
 ```
-function searchFlights(query):
-    cacheKey = hash(query)
+function search(type, query):  // type = 'flights' | 'hotels'
+    cacheKey = hash(type, query)
     cached = redis.get(cacheKey)
     if cached exists:
         return cached
 
-    providers = [Amadeus, Duffel, Tequila]
+    providers = [Duffel, LiteAPI]
     promises = []
     for provider in providers:
-        promises.push(provider.search(query).catch(() => []))  // isolate provider failures
+        promises.push(provider[type].search(query).catch(() => []))  // isolate provider failures
 
     results = awaitAllWithTimeout(promises, 2500ms)  // partial results on timeout
     merged = flatten(results)
-    deduped = deduplicateByFlightSignature(merged)
+    deduped = deduplicateBySignature(merged, type)
     normalized = normalizeToInternalSchema(deduped)  // id = provider_offer_id, nothing written to DB yet
 
     redis.set(cacheKey, normalized, ttl=5min)
     return normalized
 ```
 
-### 16.3 AI Natural-Language Search
+### 14.3 AI Natural-Language Search
 
 ```mermaid
 flowchart TD
@@ -840,7 +813,7 @@ function aiSearch(freeTextQuery):
     return { parsed, results }
 ```
 
-### 16.4 Fixed-Date Price Search
+### 14.4 Fixed-Date Price Search
 
 ```mermaid
 flowchart TD
@@ -870,7 +843,7 @@ function fixedDateSearch(origin, destination, departureDate, passengers):
     return results.sortBy(price => price, 'asc')
 ```
 
-### 16.5 Whole-Month Price View
+### 14.5 Whole-Month Price View
 
 ```mermaid
 flowchart TD
@@ -919,7 +892,7 @@ function monthPriceView(origin, destination, month, airline):
     return calendar
 ```
 
-### 16.6 Filtering & Sorting
+### 14.6 Filtering & Sorting
 
 ```mermaid
 flowchart TD
@@ -954,7 +927,7 @@ function filterAndSort(offers, filters, sort):
     return filtered.sortBy(sort.field, sort.direction)  // e.g. price/asc, duration/asc, rating/desc
 ```
 
-### 16.7 Separate Entity Bookings (Flight & Hotel Booking Creation)
+### 14.7 Separate Entity Bookings (Flight & Hotel Booking Creation)
 
 ```mermaid
 flowchart TD
@@ -968,7 +941,25 @@ flowchart TD
     G --> H[Proceed to Payment]
 ```
 
-See sequence diagram in [§9](#9-sequence-diagram-flight-booking-pipeline) (flight case; hotel case is structurally identical against `hotel_bookings`).
+Sequence below shows the flight case; the hotel case is structurally identical against `hotel_bookings`.
+
+```mermaid
+sequenceDiagram
+    participant U as User/Next.js
+    participant A as NestJS API
+    participant P as Payment Provider
+    participant D as PostgreSQL
+
+    U->>A: Book Flight (Payload)
+    A->>P: Initiate Tx
+    P-->>A: Tx Secret
+    A-->>U: Render Payment
+    U->>P: Complete Payment
+    P-->>A: Webhook Success
+    A->>D: Save Booking Data
+    Note over D: Create Record in flight_bookings
+    A-->>U: Booking Confirm
+```
 
 ```
 function createFlightBooking(providerOfferId, userId, seatNumber):
@@ -993,7 +984,7 @@ function createHotelBooking(providerOfferId, userId, checkInDate, checkOutDate):
     })
 ```
 
-### 16.8 Payment Integration
+### 14.8 Payment Integration
 
 ```mermaid
 flowchart TD
@@ -1061,7 +1052,7 @@ function onPaymentWebhook(event):
         bookingTable.update(payment.bookingId, { status: 'payment_failed' })
 ```
 
-### 16.9 Refunds
+### 14.9 Refunds
 
 ```mermaid
 flowchart TD
@@ -1123,7 +1114,7 @@ function requestRefund(bookingId, reason):
     return txn
 ```
 
-### 16.10 Post-Payment Change (Reschedule)
+### 14.10 Post-Payment Change (Reschedule)
 
 ```mermaid
 flowchart TD
@@ -1144,7 +1135,7 @@ sequenceDiagram
     participant U as Customer
     participant A as NestJS API
     participant P as Payment Provider
-    participant Ext as External Provider (Amadeus/Duffel)
+    participant Ext as External Provider (Duffel/LiteAPI)
     participant D as PostgreSQL
 
     U->>A: PATCH /flight-bookings/:id/reschedule
@@ -1189,7 +1180,7 @@ function rescheduleBooking(bookingId, newDepartureTime, newArrivalTime):
     return { bookingId, status: 'confirmed', priceDifference: diff }
 ```
 
-### 16.11 Notifications
+### 14.11 Notifications
 
 ```mermaid
 flowchart TD
@@ -1235,7 +1226,7 @@ function notificationWorker(job):
     })
 ```
 
-### 16.12 Reporting
+### 14.12 Reporting
 
 ```mermaid
 flowchart TD
@@ -1284,7 +1275,7 @@ function getDashboardMetrics(range):  // range = 'daily' | 'monthly'
     return metrics
 ```
 
-### 16.13 Customer Support
+### 14.13 Customer Support
 
 ```mermaid
 flowchart TD
@@ -1327,7 +1318,7 @@ function resolveTicket(ticketId, agentId, resolution):
     audit.log('support_ticket_resolved', ticket, { before: 'open', after: 'closed' })
 ```
 
-### 16.14 Favorites & Price-Watch Notification
+### 14.14 Favorites & Price-Watch Notification
 
 ```mermaid
 flowchart TD
@@ -1377,7 +1368,7 @@ function checkPriceWatches():
             notification.send(watch.userId, 'price_drop', { watch, currentPrice })
 ```
 
-### 16.15 Auditing & Logging
+### 14.15 Auditing & Logging
 
 ```mermaid
 flowchart TD
@@ -1420,7 +1411,7 @@ function log(level, message, context):
     })  // shipped async to ELK/Loki
 ```
 
-## 17. Testing Suite Setup
+## 15. Testing Suite Setup
 
 ### Unit & Integration Testing (Jest)
 
@@ -1485,13 +1476,15 @@ npm run test
 npm run test:e2e
 ```
 
-## 18. External Provider Integrations
+## 16. External Provider Integrations
 
-For testing/development, this project integrates against **Duffel** (flights) and **LiteAPI** (hotels) — both offer sandbox/test-mode credentials, so no real airline/hotel inventory or payment is touched during development.
+For testing/development, this project integrates against **Duffel** and **LiteAPI** — both cover flights and hotels, and both offer sandbox/test-mode credentials, so no real airline/hotel inventory or payment is touched during development. Search fans out to both for either search type ([§14.2](#142-multi-provider-search-scatter-gather)); booking/refund/reschedule ([§14.7](#147-separate-entity-bookings-flight--hotel-booking-creation), [§14.9](#149-refunds), [§14.10](#1410-post-payment-change-reschedule)) call whichever provider the chosen offer came from.
 
-### 18.1 Duffel (Flights) — [duffel.com/docs](https://duffel.com/docs)
+### 16.1 Duffel — [duffel.com/docs](https://duffel.com/docs)
 
 Base URL: `https://api.duffel.com` · Auth: `Authorization: Bearer <DUFFEL_ACCESS_TOKEN>` (test token in sandbox) · Required header: `Duffel-Version: v2`
+
+**Flights (Air):**
 
 | Step | Method & Path | Purpose |
 |---|---|---|
@@ -1503,13 +1496,24 @@ Base URL: `https://api.duffel.com` · Auth: `Authorization: Bearer <DUFFEL_ACCES
 | 6. Change (confirm) | `POST /air/order-changes/{id}/confirm` | Confirm and pay for the selected order change |
 | 7. Cancel (quote) | `POST /air/order_cancellations` | Get an unconfirmed cancellation quote (refund amount/conditions) |
 | 8. Cancel (confirm) | `POST /air/order_cancellations/{id}/actions/confirm` | Confirm the cancellation |
-| Webhooks | — | Duffel pushes order/payment events (see [Receiving Webhooks](https://duffel.com/docs/guides/receiving-webhooks)) instead of polling |
 
-Maps onto this project's flow as: step 1–3 → [§16.2 Multi-Provider Search](#162-multi-provider-search-scatter-gather), step 4 → [§16.7 Booking Creation](#167-separate-entity-bookings-flight--hotel-booking-creation), steps 5–6 → [§16.10 Reschedule](#1610-post-payment-change-reschedule), steps 7–8 → [§16.9 Refunds](#169-refunds).
+**Stays (Hotels):**
 
-### 18.2 LiteAPI (Hotels) — [docs.liteapi.travel](https://docs.liteapi.travel/reference/overview)
+| Step | Method & Path | Purpose |
+|---|---|---|
+| 1. Search | `POST /v2/search/stays-search` | Search accommodation for a location/date range |
+| 2. Rates | `GET /v2/search-result/{search_result_id}/rates` | Fetch all available rooms/rates for a search result |
+| 3. Quote | `POST /v2/quotes` | Request a firm quote for a `rate_id` |
+| 4. Book | `POST /v2/bookings` | Finalize the purchase of a quote |
+| 5. Retrieve | `GET /v2/bookings/{id}` | Get booking details |
+
+Webhooks: Duffel pushes order/payment events (see [Receiving Webhooks](https://duffel.com/docs/guides/receiving-webhooks)) instead of polling.
+
+### 16.2 LiteAPI — [docs.liteapi.travel](https://docs.liteapi.travel/reference/overview)
 
 Base URL: `https://api.liteapi.travel` · Auth: `X-API-Key: <LITEAPI_KEY>` (sandbox key for testing)
+
+**Hotels:**
 
 | Step | Method & Path | Purpose |
 |---|---|---|
@@ -1519,10 +1523,19 @@ Base URL: `https://api.liteapi.travel` · Auth: `X-API-Key: <LITEAPI_KEY>` (sand
 | 3. Verify hold | `GET /prebooks/{prebookId}` | Retrieve prebook details (final price/conditions) before paying |
 | 4. Book | `POST /rates/book` | Complete the booking and charge payment |
 | 5. Retrieve | `GET /bookings/{bookingId}` | Get a specific booking's details |
-| 5b. List | `GET /bookings` | List all bookings |
 | 6. Cancel | `PUT /bookings/{bookingId}` | Cancel a booking |
 | 7. Amend | `PUT /bookings/{bookingId}/amend` | Change the guest name on a booking |
 | 7b. Amend dates | `POST /bookings/{bookingId}/alternative-prebooks` | Reschedule: get alternative prebooks for new dates/occupancy |
-| Content | `GET /data/hotels`, `GET /data/hotels/{hotelId}`, `GET /data/reviews` | Hotel details, amenities, and reviews (not booking-related) |
 
-Maps onto this project's flow as: steps 1–1b → [§16.2 Multi-Provider Search](#162-multi-provider-search-scatter-gather), steps 2–4 → [§16.7 Booking Creation](#167-separate-entity-bookings-flight--hotel-booking-creation), step 6 → [§16.9 Refunds](#169-refunds), steps 7–7b → [§16.10 Reschedule](#1610-post-payment-change-reschedule).
+**Flights:**
+
+| Step | Method & Path | Purpose |
+|---|---|---|
+| 1. Search | `POST /flights/rates` | Search flights (legs-based itinerary) |
+| 1b. Verify | `POST /flights/verify` | Verify a flight offer before booking |
+| 1c. Month view | `POST /flights/rates/matrix` | Flexible-date price matrix (one-way or round-trip) — backs [§14.5 Whole-Month Price View](#145-whole-month-price-view) |
+| 2. Hold | `POST /flights/prebooks` | Create a checkout session (prebook) |
+| 3. Book | `POST /flights/bookings` | Complete the booking |
+| 4. Retrieve | `GET /flights/bookings/{bookingId}` | Get booking details |
+
+**Content:** `GET /data/hotels`, `GET /data/hotels/{hotelId}`, `GET /data/reviews`, `GET /data/flights/airlines`, `GET /data/flights/airports` — reference data, not booking-related.
